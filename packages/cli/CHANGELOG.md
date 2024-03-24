@@ -1,5 +1,36 @@
 # shadcn-svelte
 
+## 0.9.3
+
+### Patch Changes
+
+- 222f462: chore: Replaced `tsconfig-paths` for a custom path alias resolver
+
+## 0.9.2
+
+### Patch Changes
+
+- 7f39dbf: fix: Icons are now installed in the `add` command
+
+## 0.9.1
+
+### Patch Changes
+
+- 8c43ad3: chore: Optimized dependencies and minified package
+- 8c43ad3: chore: Replaced `zod` for `valibot`
+
+## 0.9.0
+
+### Minor Changes
+
+- 66931b3: feat: Added support for the `--proxy` flag to the `update` command
+- 66931b3: feat: Graphical overhaul, replacing `prompts` for `@clack/prompts`
+- 66931b3: feat: Added a prompt to overwrite existing components to the `add` command
+
+### Patch Changes
+
+- 66931b3: perf: Optimized dependency installation
+
 ## 0.8.3
 
 ### Patch Changes
