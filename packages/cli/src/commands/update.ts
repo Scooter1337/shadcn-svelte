@@ -1,15 +1,16 @@
-import { existsSync, promises as fs } from "fs";
-import path from "path";
+import { existsSync, promises as fs } from "node:fs";
+import path from "node:path";
+import process from "node:process";
 import color from "chalk";
 import { Command } from "commander";
 import { execa } from "execa";
 import * as v from "valibot";
-import { getConfig, type Config } from "../utils/get-config";
-import { getPackageManager } from "../utils/get-package-manager";
-import { handleError } from "../utils/handle-error";
+import { type Config, getConfig } from "../utils/get-config.js";
+import { getPackageManager } from "../utils/get-package-manager.js";
+import { error, handleError } from "../utils/errors.js";
 import { fetchTree, getItemTargetPath, getRegistryIndex, resolveTree } from "../utils/registry";
-import { UTILS } from "../utils/templates";
-import { transformImports } from "../utils/transformers";
+import { UTILS, UTILS_JS } from "../utils/templates.js";
+import { transformImports } from "../utils/transformers.js";
 import * as p from "../utils/prompts.js";
 import { intro, prettifyList } from "../utils/prompt-helpers.js";
 import { getEnvProxy } from "../utils/get-env-proxy.js";
@@ -32,7 +33,7 @@ export const update = new Command()
 	.argument("[components...]", "name of components")
 	.option("-a, --all", "update all existing components.", false)
 	.option("-y, --yes", "skip confirmation prompt.", false)
-	.option("--proxy <proxy>", "fetch components from registry using a proxy.")
+	.option("--proxy <proxy>", "fetch components from registry using a proxy.", getEnvProxy())
 	.option(
 		"-c, --cwd <cwd>",
 		"the working directory. defaults to the current directory.",
@@ -50,16 +51,14 @@ export const update = new Command()
 			const cwd = path.resolve(options.cwd);
 
 			if (!existsSync(cwd)) {
-				p.cancel(`The path ${color.cyan(cwd)} does not exist. Please try again.`);
-				process.exit(1);
+				throw error(`The path ${color.cyan(cwd)} does not exist. Please try again.`);
 			}
 
 			const config = await getConfig(cwd);
 			if (!config) {
-				p.cancel(
+				throw error(
 					`Configuration file is missing. Please run ${color.green("init")} to create a ${highlight("components.json")} file.`
 				);
-				process.exit(1);
 			}
 
 			await runUpdate(cwd, config, options);
@@ -75,24 +74,17 @@ export const update = new Command()
 	});
 
 async function runUpdate(cwd: string, config: Config, options: UpdateOptions) {
-	const components = options.components;
-
-	const proxy = options.proxy ?? getEnvProxy();
-	if (proxy) {
-		const isCustom = !!options.proxy;
-		if (isCustom) process.env.HTTP_PROXY = options.proxy;
-
-		p.log.warn(
-			`You are using a ${isCustom ? "provided" : "system environment"} proxy: ${color.green(proxy)}`
-		);
+	if (options.proxy !== undefined) {
+		process.env.HTTP_PROXY = options.proxy;
+		p.log.info(`You are using the provided proxy: ${color.green(options.proxy)}`);
 	}
 
+	const components = options.components;
 	const registryIndex = await getRegistryIndex();
 
 	const componentDir = path.resolve(config.resolvedPaths.components, "ui");
 	if (!existsSync(componentDir)) {
-		p.cancel(`Component directory ${color.cyan(componentDir)} does not exist.`);
-		process.exit(1);
+		throw error(`Component directory ${color.cyan(componentDir)} does not exist.`);
 	}
 
 	// Retrieve existing components in user's project
@@ -170,12 +162,11 @@ async function runUpdate(cwd: string, config: Config, options: UpdateOptions) {
 		const utilsPath = config.resolvedPaths.utils + extension;
 
 		if (!existsSync(utilsPath)) {
-			p.cancel(`Failed to find ${highlight("utils")} at ${color.cyan(utilsPath)}`);
-			process.exit(1);
+			throw error(`Failed to find ${highlight("utils")} at ${color.cyan(utilsPath)}`);
 		}
 
 		// utils.(ts|js) is not in the registry, it is a template, so we'll just overwrite it
-		await fs.writeFile(utilsPath, UTILS);
+		await fs.writeFile(utilsPath, config.typescript ? UTILS : UTILS_JS);
 	}
 
 	const tree = await resolveTree(
@@ -186,62 +177,68 @@ async function runUpdate(cwd: string, config: Config, options: UpdateOptions) {
 
 	const componentsToRemove: Record<string, string[]> = {};
 	const dependencies = new Set<string>();
+	const tasks: p.Task[] = [];
 	for (const item of payload) {
-		const updateSpinner = p.spinner();
-		updateSpinner.start(`Updating ${highlight(item.name)}`);
 		const targetDir = getItemTargetPath(config, item);
-
 		if (!targetDir) {
 			continue;
-		}
-
-		if (!existsSync(targetDir)) {
-			await fs.mkdir(targetDir, { recursive: true });
-		}
-
-		const componentDir = path.resolve(targetDir, item.name);
-		if (!existsSync(componentDir)) {
-			await fs.mkdir(componentDir, { recursive: true });
-		}
-
-		for (const file of item.files) {
-			const filePath = path.resolve(targetDir, item.name, file.name);
-
-			// Run transformers.
-			const content = transformImports(file.content, config);
-
-			await fs.writeFile(filePath, content);
-		}
-
-		const installedFiles = await fs.readdir(componentDir);
-		const remoteFiles = item.files.map((file) => file.name);
-		const filesToDelete = installedFiles
-			.filter((file) => !remoteFiles.includes(file))
-			.map((file) => path.resolve(targetDir, item.name, file));
-
-		if (filesToDelete.length > 0) {
-			componentsToRemove[item.name] = filesToDelete;
 		}
 
 		// Add dependencies to the install list
 		item.dependencies.forEach((dep) => dependencies.add(dep));
 
-		const componentPath = path.relative(process.cwd(), path.resolve(targetDir, item.name));
-		updateSpinner.stop(`${highlight(item.name)} updated at ${color.gray(componentPath)}`);
+		// Update Components
+		tasks.push({
+			title: `Updating ${highlight(item.name)}`,
+			async task() {
+				if (!existsSync(targetDir)) {
+					await fs.mkdir(targetDir, { recursive: true });
+				}
+
+				const componentDir = path.resolve(targetDir, item.name);
+				if (!existsSync(componentDir)) {
+					await fs.mkdir(componentDir, { recursive: true });
+				}
+
+				for (const file of item.files) {
+					const filePath = path.resolve(targetDir, item.name, file.name);
+
+					// Run transformers.
+					const content = transformImports(file.content, config);
+
+					await fs.writeFile(filePath, content);
+				}
+
+				const installedFiles = await fs.readdir(componentDir);
+				const remoteFiles = item.files.map((file) => file.name);
+				const filesToDelete = installedFiles
+					.filter((file) => !remoteFiles.includes(file))
+					.map((file) => path.resolve(targetDir, item.name, file));
+
+				if (filesToDelete.length > 0) {
+					componentsToRemove[item.name] = filesToDelete;
+				}
+
+				const componentPath = path.relative(process.cwd(), path.resolve(targetDir, item.name));
+				return `${highlight(item.name)} updated at ${color.gray(componentPath)}`;
+			},
+		});
 	}
 
 	// Install dependencies.
-	if (dependencies.size > 0) {
-		const spinner = p.spinner();
-		spinner.start("Installing new package dependencies");
+	tasks.push({
+		title: "Installing package dependencies",
+		enabled: dependencies.size > 0,
+		async task() {
+			const packageManager = await getPackageManager(cwd);
+			await execa(packageManager, ["add", ...dependencies], {
+				cwd,
+			});
+			return "Dependencies installed";
+		},
+	});
 
-		const packageManager = await getPackageManager(cwd);
-		await execa(packageManager, ["add", ...dependencies], {
-			cwd,
-		});
-
-		spinner.stop("Dependencies installed");
-	}
+	await p.tasks(tasks);
 
 	for (const [component, files] of Object.entries(componentsToRemove)) {
 		p.log.warn(

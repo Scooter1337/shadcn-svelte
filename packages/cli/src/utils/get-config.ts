@@ -1,13 +1,11 @@
-import { promises as fs } from "node:fs";
+import fs from "node:fs";
 import path from "node:path";
 import color from "chalk";
-import { execa } from "execa";
-import { parseNative } from "tsconfck";
 import * as v from "valibot";
-import { find } from "./find-tsconfig.js";
-import { isUsingSvelteKit } from "./get-package-info.js";
-import { getPackageManager } from "./get-package-manager.js";
+import { getTsconfig } from "get-tsconfig";
+import { ConfigError, error } from "./errors.js";
 import { resolveImport } from "./resolve-imports.js";
+import { syncSvelteKit } from "./sveltekit.js";
 
 export const DEFAULT_STYLE = "default";
 export const DEFAULT_COMPONENTS = "$lib/components";
@@ -61,55 +59,30 @@ export async function getConfig(cwd: string) {
 	return await resolveConfigPaths(cwd, config);
 }
 
-export async function getAliases() {
-	const SVELTE_CONFIG_PATH = path.resolve(process.cwd(), "svelte.config.js");
-	const IMPORT_SVELTE_CONFIG_PATH = "file://" + SVELTE_CONFIG_PATH;
-
-	const { default: svelteConfig } = await import(IMPORT_SVELTE_CONFIG_PATH);
-
-	const aliases: Record<string, string> | undefined = svelteConfig.kit.alias;
-
-	return aliases;
-}
-
 export async function resolveConfigPaths(cwd: string, config: RawConfig) {
 	// if it's a SvelteKit project, run sync so that the aliases are always up to date
-	const isSvelteKit = isUsingSvelteKit(cwd);
-	if (isSvelteKit) {
-		const packageManager = await getPackageManager(cwd);
-		await execa(packageManager === "npm" ? "npx" : packageManager, ["svelte-kit", "sync"], {
-			cwd,
-		});
-	}
+	await syncSvelteKit(cwd);
 
-	const tsconfigPath = await find(path.resolve(cwd, "package.json"), { root: cwd });
+	const tsconfigType = config.typescript ? "tsconfig.json" : "jsconfig.json";
+	const pathAliases = getTSConfig(cwd, tsconfigType);
 
-	if (tsconfigPath === null) {
-		const configToFind = config.typescript ? "tsconfig.json" : "jsconfig.json";
-		throw new Error(`Failed to find ${highlight(configToFind)}.`);
-	}
-
-	const parsedConfig = await parseNative(tsconfigPath);
-
-	const absoluteBaseUrl: string | undefined = parsedConfig.result.options.pathsBasePath;
-	let paths: Record<string, string[]> | undefined = parsedConfig.result.options.paths;
-
-	if (absoluteBaseUrl === undefined || paths === undefined) {
-		throw new Error(
-			`Specify a ${highlight("paths")} field in your ${highlight(
-				"tsconfig.json"
-			)} and define your path aliases. \n\nSee: ${color.green(
-				"https://www.shadcn-svelte.com/docs/installation#setup-path-aliases"
-			)}`
+	if (pathAliases === null) {
+		throw error(
+			`Missing ${highlight("paths")} field in your ${highlight(tsconfigType)} for path aliases. See: ${color.underline("https://www.shadcn-svelte.com/docs/installation/manual#configure-path-aliases")}`
 		);
 	}
 
-	const importOpts = {
-		absoluteBaseUrl,
-		paths,
-	};
-	const utilsPath = await resolveImport(config.aliases.utils, importOpts);
-	const componentsPath = await resolveImport(config.aliases.components, importOpts);
+	const utilsPath = resolveImport(config.aliases.utils, pathAliases);
+	const componentsPath = resolveImport(config.aliases.components, pathAliases);
+	const aliasError = (type: string, alias: string) =>
+		new ConfigError(
+			`Invalid import alias found: (${highlight(`"${type}": "${alias}"`)}) in ${highlight("components.json")}.
+   - Import aliases ${color.underline("must use")} existing path aliases defined in your ${highlight(tsconfigType)} (e.g. "${type}": "$lib/${type}").
+   - See: ${color.underline("https://www.shadcn-svelte.com/docs/installation/manual#configure-path-aliases")}.`
+		);
+
+	if (utilsPath === undefined) throw aliasError("utils", config.aliases.utils);
+	if (componentsPath === undefined) throw aliasError("components", config.aliases.components);
 
 	return v.parse(configSchema, {
 		...config,
@@ -122,14 +95,25 @@ export async function resolveConfigPaths(cwd: string, config: RawConfig) {
 	});
 }
 
+export function getTSConfig(cwd: string, tsconfigName: "tsconfig.json" | "jsconfig.json") {
+	const parsedConfig = getTsconfig(path.resolve(cwd, "package.json"), tsconfigName);
+	if (parsedConfig === null) {
+		throw error(
+			`Failed to find ${highlight(tsconfigName)}. See: ${color.underline("https://www.shadcn-svelte.com/docs/installation#opt-out-of-typescript")}`
+		);
+	}
+
+	return parsedConfig;
+}
+
 export async function getRawConfig(cwd: string): Promise<RawConfig | null> {
 	const configPath = path.resolve(cwd, "components.json");
 	try {
-		const configResult = await fs
+		const configResult = await fs.promises
 			.readFile(configPath, {
 				encoding: "utf8",
 			})
-			.catch((e) => null);
+			.catch(() => null);
 
 		// no predefined config exists
 		if (!configResult) {
@@ -139,7 +123,7 @@ export async function getRawConfig(cwd: string): Promise<RawConfig | null> {
 		const config = JSON.parse(configResult);
 
 		return v.parse(rawConfigSchema, config);
-	} catch (error) {
-		throw new Error(`Invalid configuration found in ${highlight(configPath)}.`);
+	} catch (err) {
+		throw new ConfigError(`Invalid configuration found in ${highlight(configPath)}.`);
 	}
 }
